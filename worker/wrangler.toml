@@ -1,0 +1,8 @@
+name = "newtube-web"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Set this to your GitHub Pages address so nobody else can use your Worker, e.g.
+# ALLOWED_ORIGINS = "https://yourname.github.io"
+ALLOWED_ORIGINS = ""

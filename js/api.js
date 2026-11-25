@@ -12,11 +12,28 @@ export function workerUrl() {
   return u.replace(/\/+$/, "");
 }
 
+// Defaults: English, Cyprus. The phone's own language is ignored on purpose.
+// YouTube only accepts ISO country codes, so "UK" must be sent as "GB";
+// anything else it would reject ("Request contains an invalid argument") falls back to the default.
+const GL_ALIASES = { UK: "GB", EL: "GR" };
 export function locale() {
   const s = LS.get("settings", {});
-  const nav = (navigator.language || "en-US").split("-");
-  return { hl: s.hl || nav[0] || "en", gl: (s.gl || nav[1] || "US").toUpperCase() };
+  let hl = String(s.hl || "en").trim();
+  if (!/^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(hl)) hl = "en";
+  let gl = String(s.gl || "CY").trim().toUpperCase();
+  gl = GL_ALIASES[gl] || gl;
+  if (!/^[A-Z]{2}$/.test(gl)) gl = "CY";
+  return { hl, gl };
 }
+// One-time move from the old auto-detected Russian/UK setting to English/Cyprus.
+(() => {
+  if (LS.get("localeFix1", false)) return;
+  const s = LS.get("settings", {});
+  delete s.hl; delete s.gl;
+  LS.set("settings", s);
+  LS.del("visitor");
+  LS.set("localeFix1", true);
+})();
 
 export class ApiError extends Error {
   constructor(msg, status, detail) { super(msg); this.status = status; this.detail = detail; }

@@ -1,7 +1,7 @@
-import { yt, auth, LS, workerUrl, ping, dislikes, ApiError, locale } from "./api.js?v=3";
-import { collectItems, parseNext, parseComments, parseChannel, text, findKey, bestThumb, agoSeconds, fmtDuration, parseDuration, ytThumb } from "./parse.js?v=3";
-import { mountPlayer, getPlayerResponse } from "./player.js?v=3";
-import { downloadOptions, downloadVideo } from "./download.js?v=3";
+import { yt, auth, LS, workerUrl, ping, dislikes, ApiError, locale } from "./api.js?v=5";
+import { collectItems, parseNext, parseComments, parseChannel, text, findKey, bestThumb, agoSeconds, fmtDuration, parseDuration, ytThumb } from "./parse.js?v=5";
+import { mountPlayer, getPlayerResponse } from "./player.js?v=5";
+import { downloadOptions, downloadVideo } from "./download.js?v=5";
 
 {
 const $ = (s, el = document) => el.querySelector(s);
@@ -22,6 +22,8 @@ const I = {
   more: '<svg viewBox="0 0 24 24"><circle cx="12" cy="5.5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="18.5" r="1.4"/></svg>',
   hide: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg>',
   dl: '<svg viewBox="0 0 24 24"><path d="M12 3.5v12M7.5 11 12 15.5 16.5 11M5 19.5h14"/></svg>',
+  vol: '<svg viewBox="0 0 24 24"><path d="M4.5 9.5h3l4.5-4v13l-4.5-4h-3z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>',
+  mute: '<svg viewBox="0 0 24 24"><path d="M4.5 9.5h3l4.5-4v13l-4.5-4h-3z"/><path d="m16 9.5 5 5M21 9.5l-5 5"/></svg>',
   x: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   yt: '<svg viewBox="0 0 24 24"><path d="M14 4.5h5.5V10M19.5 4.5 11 13M9.5 5.5H6A1.5 1.5 0 0 0 4.5 7v11A1.5 1.5 0 0 0 6 19.5h11a1.5 1.5 0 0 0 1.5-1.5v-3.5"/></svg>',
 };
@@ -297,6 +299,57 @@ async function shareLink(url, title) {
   copy(url, "Link copied");
 }
 
+async function openDownload(id, title) {
+  toast("Getting download options…");
+  let sd = null;
+  let lengthSec = 0;
+  try {
+    const r = await getPlayerResponse(id, ["vr", "ios"]);
+    sd = r.pr && r.pr.streamingData;
+    const vd = (r.pr && r.pr.videoDetails) || {};
+    lengthSec = Number(vd.lengthSeconds) || 0;
+    if (!title) title = vd.title || "";
+  } catch (_) {}
+  const opts = sd ? downloadOptions(sd) : [];
+  if (!opts.length) { toast("Download isn't available for this video"); return; }
+  const mb = (n) => n ? ` · ${Math.max(1, Math.round(n / 1048576))} MB` : "";
+  const s = sheet(`<h2>Download</h2><div id="dlbody">${opts.map((o, i) => `<button class="opt" data-i="${i}">${esc(o.label)}<span class="muted">${mb(o.size)}</span></button>`).join("")}
+    <p class="muted" style="font-size:13px;margin:10px 4px 0">Keep this open until it finishes. Long videos in 1080p take a while and use a lot of memory.</p></div>`, () => ac.abort());
+  const ac = new AbortController();
+  s.el.addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-i]"); if (!b) return;
+    const opt = opts[Number(b.dataset.i)];
+    const body = $("#dlbody", s.el);
+    body.innerHTML = `<p style="margin:6px 4px">Downloading ${esc(opt.label)}…</p><div class="dlbar"><i id="dlfill"></i></div><p class="muted" id="dlpct" style="margin:8px 4px">0%</p>`;
+    title = title || id;
+    const name = title.replace(/[\\/:*?"<>|]+/g, "").slice(0, 80).trim() + ` (${opt.label.split(" ")[0]}).mp4`;
+    try {
+      const blob = await downloadVideo(opt, {
+        durationSec: lengthSec,
+        refresh: async () => (await getPlayerResponse(id, ["vr", "ios"])).pr.streamingData,
+        signal: ac.signal,
+        onProgress: (f, bytes) => {
+          const fill = $("#dlfill", s.el), pct = $("#dlpct", s.el);
+          if (fill) fill.style.width = (f * 100).toFixed(1) + "%";
+          if (pct) pct.textContent = f ? Math.floor(f * 100) + "%" : Math.round(bytes / 1048576) + " MB";
+        },
+      });
+      const file = new File([blob], name, { type: "video/mp4" });
+      const url = URL.createObjectURL(blob);
+      body.innerHTML = `<p style="margin:6px 4px">Ready: ${esc(name)} (${Math.round(blob.size / 1048576)} MB)</p>
+        <div class="row" style="margin-top:12px;gap:10px;flex-wrap:wrap">
+          ${navigator.canShare && navigator.canShare({ files: [file] }) ? `<button class="btn" id="dlsave">Save video</button>` : ""}
+          <a class="btn ${navigator.canShare ? "ghost" : ""}" href="${url}" download="${esc(name)}" style="display:inline-grid;place-items:center">Save to Files</a>
+        </div><p class="muted" style="font-size:13px;margin:10px 4px 0">"Save video" lets you put it in Photos.</p>`;
+      const sv = $("#dlsave", s.el);
+      if (sv) sv.onclick = async () => { try { await navigator.share({ files: [file], title }); } catch (_) {} };
+    } catch (err) {
+      if (ac.signal.aborted) return;
+      body.innerHTML = `<p style="margin:6px 4px">Couldn't download: ${esc(err.message)}</p>`;
+    }
+  });
+}
+
 function viewWatch(id) {
   view.innerHTML = `<div class="watch"><div class="watch-main">
       <div class="player" id="player"><div class="spin"><div class="spinner"></div></div></div>
@@ -361,10 +414,10 @@ function viewWatch(id) {
       <div class="actions">
         <button class="pill" id="like">${I.up}<span id="likes">Like</span></button>
         <button class="pill" id="dislike">${I.down}<span id="dislikes"></span></button>
-        <button class="pill ${later ? "on" : ""}" id="later">${later ? I.check : I.later}<span>Watch later</span></button>
+        <button class="pill" id="download">${I.dl}<span>Download</span></button>
         <button class="pill" id="copylink">${I.link}<span>Copy link</span></button>
         <button class="pill" id="share">${I.share}<span>Share</span></button>
-        <button class="pill" id="download">${I.dl}<span>Download</span></button>
+        <button class="pill ${later ? "on" : ""}" id="later">${later ? I.check : I.later}<span>Watch later</span></button>
         <button class="pill" id="quality">${I.hd}<span>Quality</span></button>
         <button class="pill" id="speed">${I.speed}<span>Speed</span></button>
         ${d.commentsToken ? `<button class="pill" id="comments">${I.comment}<span>Comments</span></button>` : ""}
@@ -408,7 +461,7 @@ function viewWatch(id) {
   };
 
   const qualitySheet = () => {
-    if (!ctl || ctl.mode !== "dash") { toast(ctl && ctl.mode === "embed" ? "Use the player's own settings" : "Only one quality available"); return; }
+    if (!ctl || ctl.mode !== "dash") { toast(ctl && ctl.mode === "embed" ? "Use the player's own settings" : ctl && ctl.mode === "hls" ? "Quality is picked automatically for your connection" : "Only one quality available"); return; }
     const hs = ctl.qualities(), cur = LS.get("quality", "auto");
     const s = sheet(`<h2>Quality</h2>${["auto", ...hs].map((h) => `<button class="opt ${String(cur) === String(h) ? "on" : ""}" data-h="${h}">${h === "auto" ? `Auto${ctl.currentHeight() ? ` (${ctl.currentHeight()}p)` : ""}` : h + "p"}${String(cur) === String(h) ? I.check : ""}</button>`).join("")}`);
     s.el.addEventListener("click", (e) => {
@@ -417,47 +470,7 @@ function viewWatch(id) {
       s.close();
     });
   };
-  const downloadSheet = () => {
-    const sd = ctl && ctl.pr && ctl.pr.streamingData;
-    const opts = sd ? downloadOptions(sd) : [];
-    if (!opts.length) { toast(ctl ? "Download isn't available for this video" : "Still loading, try again in a moment"); return; }
-    const mb = (n) => n ? ` · ${Math.max(1, Math.round(n / 1048576))} MB` : "";
-    const s = sheet(`<h2>Download</h2><div id="dlbody">${opts.map((o, i) => `<button class="opt" data-i="${i}">${esc(o.label)}<span class="muted">${mb(o.size)}</span></button>`).join("")}
-      <p class="muted" style="font-size:13px;margin:10px 4px 0">Keep this open until it finishes. Long videos in 1080p take a while and use a lot of memory.</p></div>`, () => ac.abort());
-    const ac = new AbortController();
-    s.el.addEventListener("click", async (e) => {
-      const b = e.target.closest("[data-i]"); if (!b) return;
-      const opt = opts[Number(b.dataset.i)];
-      const body = $("#dlbody", s.el);
-      body.innerHTML = `<p style="margin:6px 4px">Downloading ${esc(opt.label)}…</p><div class="dlbar"><i id="dlfill"></i></div><p class="muted" id="dlpct" style="margin:8px 4px">0%</p>`;
-      const title = (nextData && nextData.title) || meta.title || id;
-      const name = title.replace(/[\\/:*?"<>|]+/g, "").slice(0, 80).trim() + ` (${opt.label.split(" ")[0]}).mp4`;
-      try {
-        const blob = await downloadVideo(opt, {
-          durationSec: meta.seconds || Number((ctl.pr.videoDetails || {}).lengthSeconds) || 0,
-          refresh: async () => (await getPlayerResponse(id)).pr.streamingData,
-          signal: ac.signal,
-          onProgress: (f, bytes) => {
-            const fill = $("#dlfill", s.el), pct = $("#dlpct", s.el);
-            if (fill) fill.style.width = (f * 100).toFixed(1) + "%";
-            if (pct) pct.textContent = f ? Math.floor(f * 100) + "%" : Math.round(bytes / 1048576) + " MB";
-          },
-        });
-        const file = new File([blob], name, { type: "video/mp4" });
-        const url = URL.createObjectURL(blob);
-        body.innerHTML = `<p style="margin:6px 4px">Ready: ${esc(name)} (${Math.round(blob.size / 1048576)} MB)</p>
-          <div class="row" style="margin-top:12px;gap:10px;flex-wrap:wrap">
-            ${navigator.canShare && navigator.canShare({ files: [file] }) ? `<button class="btn" id="dlsave">Save video</button>` : ""}
-            <a class="btn ${navigator.canShare ? "ghost" : ""}" href="${url}" download="${esc(name)}" style="display:inline-grid;place-items:center">Save to Files</a>
-          </div><p class="muted" style="font-size:13px;margin:10px 4px 0">"Save video" lets you put it in Photos.</p>`;
-        const sv = $("#dlsave", s.el);
-        if (sv) sv.onclick = async () => { try { await navigator.share({ files: [file], title }); } catch (_) {} };
-      } catch (err) {
-        if (ac.signal.aborted) return;
-        body.innerHTML = `<p style="margin:6px 4px">Couldn't download: ${esc(err.message)}</p>`;
-      }
-    });
-  };
+  const downloadSheet = () => openDownload(id, (nextData && nextData.title) || meta.title || "");
   const speedSheet = () => {
     if (!ctl || ctl.mode === "embed") { toast("Use the player's own settings"); return; }
     const cur = ctl.video.playbackRate;
@@ -619,6 +632,7 @@ async function shortsBatch(state) {
   return found;
 }
 
+let shortsSound = false; // iPhone only lets sound start after a tap
 function viewShorts() {
   view.innerHTML = `<div class="shorts" id="shorts"><div class="short"><div class="spinner"></div></div></div>`;
   const wrap = $("#shorts");
@@ -629,6 +643,8 @@ function viewShorts() {
       <div class="splayer" style="background-image:url('${esc(v.thumb || ytThumb(v.id))}')"></div>
       <div class="sinfo"><h3>${esc(v.title)}</h3><p>${esc(v.views || "")}</p></div>
       <div class="sbtns">
+        <button class="sbtn" data-act="sound" aria-label="Sound">${shortsSound ? I.vol : I.mute}</button>
+        <button class="sbtn" data-act="dl" aria-label="Download">${I.dl}</button>
         <button class="sbtn" data-act="copy" aria-label="Copy link">${I.link}</button>
         <button class="sbtn" data-act="share" aria-label="Share">${I.share}</button>
         <a class="sbtn" href="#/watch?v=${esc(v.id)}" aria-label="Open as video">${I.yt}</a>
@@ -668,6 +684,8 @@ function viewShorts() {
     current = c;
     c.video.controls = false;
     c.video.loop = true;
+    c.video.muted = !shortsSound;
+    c.video.play().catch(() => { c.video.muted = true; shortsSound = false; c.video.play().catch(() => {}); });
     c.video.addEventListener("click", () => { if (c.video.paused) c.video.play().catch(() => {}); else c.video.pause(); });
     store.add("history", { id, title: $("h3", el).textContent, seconds: Number((c.pr && c.pr.videoDetails || {}).lengthSeconds) || 0 }, 300);
     // Keep a few ahead loaded
@@ -682,6 +700,12 @@ function viewShorts() {
   wrap.addEventListener("click", (e) => {
     const b = e.target.closest("[data-act]"); if (!b) return;
     const el = b.closest(".short"), id = el.dataset.id, url = `https://youtube.com/shorts/${id}`;
+    if (b.dataset.act === "sound") {
+      shortsSound = !shortsSound;
+      if (current && current.video) { current.video.muted = !shortsSound; current.video.play().catch(() => {}); }
+      wrap.querySelectorAll('[data-act="sound"]').forEach((x) => { x.innerHTML = shortsSound ? I.vol : I.mute; });
+    }
+    if (b.dataset.act === "dl") openDownload(id, $("h3", el).textContent);
     if (b.dataset.act === "copy") copy(url, "Link copied");
     if (b.dataset.act === "share") shareLink(url, $("h3", el).textContent);
     if (b.dataset.act === "hide") {
@@ -976,6 +1000,7 @@ function cardMenu(b) {
   const s = sheet(`<h2 style="padding-right:40px">${esc(v.title)}</h2>
     <button class="opt" data-a="copy">Copy link${I.link}</button>
     <button class="opt" data-a="share">Share…${I.share}</button>
+    <button class="opt" data-a="dl">Download${I.dl}</button>
     <button class="opt" data-a="later">${later ? "Remove from Watch later" : "Save to Watch later"}${I.later}</button>
     <button class="opt" data-a="hide">Not interested${I.hide}</button>
     ${v.channelId ? `<button class="opt" data-a="hidech">Don't recommend ${esc(v.channel || "this channel")}${I.hide}</button>` : ""}`);
@@ -986,6 +1011,7 @@ function cardMenu(b) {
     s.close();
     if (act === "copy") copy(url, "Link copied");
     else if (act === "share") shareLink(url, v.title);
+    else if (act === "dl") openDownload(v.id, v.title);
     else if (act === "later") toast(store.toggle("later", v) ? "Saved to Watch later" : "Removed from Watch later");
     else if (act === "hide") { store.add("hiddenVideos", { id: v.id }, 2000); if (card) card.remove(); toast("Got it, you won't see this video again"); }
     else if (act === "hidech") {

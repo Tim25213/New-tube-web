@@ -1,13 +1,19 @@
 // Ad-free playback: asks YouTube for the raw streams (app clients that need no
 // extra tokens), builds a DASH manifest and plays it with Shaka through your Worker.
 // Falls back to a single 360p file, then to YouTube's embed player.
-import { yt, proxied, sponsorSegments, LS } from "./api.js?v=3";
+import { yt, proxied, sponsorSegments, LS, workerUrl } from "./api.js?v=5";
 
 const xml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-export async function getPlayerResponse(id) {
+// iPhone/iPad/Mac Safari play HLS natively: the most reliable player there.
+export const nativeHls = (() => {
+  try { return !!document.createElement("video").canPlayType("application/vnd.apple.mpegurl"); } catch (_) { return false; }
+})();
+const appleDevice = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent || "");
+
+export async function getPlayerResponse(id, order = ["vr", "ios"]) {
   const errors = [];
-  for (const client of ["vr", "ios"]) {
+  for (const client of order) {
     try {
       const pr = await yt("player", {
         videoId: id, contentCheckOk: true, racyCheckOk: true,
@@ -36,6 +42,7 @@ export function buildMpd(sd, durationSec) {
     if (kind === "audio" && audioDefault && f.audioTrack && f.audioTrack.id !== audioDefault.audioTrack.id) continue;
     if (/drc/i.test(f.xtags || "") || f.isDrc) continue;
     const family = codecs.split(".")[0];
+    if (appleDevice && !["avc1", "mp4a"].includes(family)) continue;
     const key = `${kind}/${container}/${family}`;
     if (!groups.has(key)) groups.set(key, { kind, mime: `${kind}/${container}`, list: [] });
     groups.get(key).list.push({ ...f, codecs });
@@ -118,22 +125,42 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
     onMode && onMode("embed", why);
   };
 
-  const { pr, errors } = await getPlayerResponse(id);
-  ctl.pr = pr; ctl.errors = errors;
+  // Order of players: native HLS (Apple) -> Shaka DASH -> YouTube embed.
+  const first = await getPlayerResponse(id, nativeHls ? ["ios", "vr"] : ["vr", "ios"]);
+  const pr = first.pr;
+  ctl.pr = pr; ctl.errors = first.errors;
   if (!pr || !pr.streamingData || (pr.videoDetails && pr.videoDetails.isLive)) {
-    embed(pr && pr.videoDetails && pr.videoDetails.isLive ? "live" : errors.join(" | ") || "no streams");
+    embed(pr && pr.videoDetails && pr.videoDetails.isLive ? "live" : ctl.errors.join(" | ") || "no streams");
     return ctl;
   }
   const dur = Number((pr.videoDetails && pr.videoDetails.lengthSeconds) || 0);
 
-  const progressive = (sd, at) => {
+  const resetVideo = async () => {
+    if (ctl.shaka) { try { await ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
+    video.onerror = null;
+    video.removeAttribute("src");
+    try { video.load(); } catch (_) {}
+  };
+  const seekWhenReady = (at) => { if (at) video.addEventListener("loadedmetadata", () => { try { video.currentTime = at; } catch (_) {} }, { once: true }); };
+
+  const playHls = async (url, at) => {
+    await resetVideo();
+    ctl.mode = "hls";
+    video.onerror = () => recover("hls error " + ((video.error && video.error.code) || ""));
+    video.src = workerUrl() + "/hls?u=" + encodeURIComponent(url);
+    seekWhenReady(at);
+    video.play().catch(() => {});
+    onMode && onMode("hls");
+  };
+
+  const progressive = async (sd, at) => {
     const f = (sd.formats || []).filter((f) => f.url).sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-    if (!f) return embed("no progressive stream", at);
-    if (ctl.shaka) { try { ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
+    if (!f) throw new Error("no progressive stream");
+    await resetVideo();
     ctl.mode = "progressive";
-    video.src = proxied(f.url);
-    if (at) video.addEventListener("loadedmetadata", () => { video.currentTime = at; }, { once: true });
     video.onerror = () => recover("progressive stream failed");
+    video.src = proxied(f.url);
+    seekWhenReady(at);
     video.play().catch(() => {});
     onMode && onMode("progressive");
   };
@@ -144,7 +171,7 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
     if (!mpd || !shaka || !shaka.Player.isBrowserSupported()) return progressive(sd, at);
     try {
       shaka.polyfill.installAll();
-      if (ctl.shaka) { try { await ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
+      await resetVideo();
       const p = new shaka.Player();
       await p.attach(video);
       ctl.shaka = p;
@@ -167,33 +194,35 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
       onMode && onMode("dash");
     } catch (e) {
       console.warn("dash failed", e);
-      progressive(sd, at);
+      return progressive(sd, at);
     }
   };
 
-  // If the stream stops (YouTube cuts the connection after a few seconds on some videos),
-  // first get fresh stream addresses and carry on from the same spot; if it stops again,
-  // switch to YouTube's own player at that spot so the video keeps going.
-  let tries = 0, recovering = false;
+  // Steps to try, in order. If one fails or freezes, the next one picks up at the same spot.
+  const steps = [];
+  if (nativeHls && pr.streamingData.hlsManifestUrl) steps.push({ name: "hls", run: (at) => playHls(pr.streamingData.hlsManifestUrl, at) });
+  steps.push({ name: "dash", run: async (at) => {
+    let sd = pr.streamingData;
+    if (steps.length > 1 || ctl.errors.length) {
+      // Fresh addresses from the VR app client (its streams don't get cut off).
+      const fresh = await getPlayerResponse(id, ["vr", "ios"]).catch(() => null);
+      if (fresh && fresh.pr && fresh.pr.streamingData) sd = fresh.pr.streamingData;
+    }
+    return playDash(sd, at);
+  } });
+  let step = -1, recovering = false;
+  const next = async (at, why) => {
+    step++;
+    if (why) ctl.errors.push(`${steps[step - 1] ? steps[step - 1].name : "?"} failed at ${Math.floor(at || 0)}s: ${why}`);
+    if (step >= steps.length) return embed("stalled: " + why, at);
+    if (step > 0) onMode && onMode("recovering");
+    try { await steps[step].run(at); } catch (e) { return next(at, e.message); }
+  };
   const recover = async (why) => {
     if (recovering || ctl.mode === "embed") return;
     recovering = true;
     const at = video.currentTime > 1 ? video.currentTime : start;
-    tries++;
-    ctl.errors.push(`recover #${tries} at ${Math.floor(at)}s: ${why}`);
-    if (tries <= 1) {
-      onMode && onMode("recovering");
-      try {
-        const fresh = await getPlayerResponse(id);
-        if (fresh.pr && fresh.pr.streamingData) {
-          ctl.pr = fresh.pr;
-          await playDash(fresh.pr.streamingData, at);
-          recovering = false;
-          return;
-        }
-      } catch (_) { /* fall through */ }
-    }
-    embed("stalled: " + why, at);
+    await next(at, why);
     recovering = false;
   };
 
@@ -204,9 +233,10 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
     stuck = Math.abs(video.currentTime - lastT) < 0.05 ? stuck + 1 : 0;
     lastT = video.currentTime;
     if (stuck >= 8) { stuck = 0; recover("stuck buffering"); }
+    if (video.currentTime > 4 && video.videoWidth === 0 && ctl.mode !== "embed" && !ctl._blackChecked) { ctl._blackChecked = true; recover("no picture"); }
   }, 1000);
 
-  await playDash(pr.streamingData, start);
+  await next(start);
 
   // Lock-screen / headset controls
   if ("mediaSession" in navigator && meta) {

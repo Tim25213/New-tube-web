@@ -1,7 +1,7 @@
 // Download a video as one .mp4 file (up to 1080p).
 // YouTube keeps HD picture and sound in separate files, so this downloads both
 // (in small pieces through your Worker) and joins them into one MP4 right in the browser.
-import { proxied } from "./api.js?v=3";
+import { proxied } from "./api.js?v=5";
 
 // ---------- MP4 joining (fragmented MP4 in, fragmented MP4 out) ----------
 const u32 = (b, o) => ((b[o] << 24) >>> 0) + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];

@@ -1,6 +1,7 @@
-import { yt, auth, LS, workerUrl, ping, dislikes, ApiError, locale } from "./api.js?v=2";
-import { collectItems, parseNext, parseComments, parseChannel, text, findKey, bestThumb, agoSeconds, fmtDuration, parseDuration, ytThumb } from "./parse.js?v=2";
-import { mountPlayer, getPlayerResponse } from "./player.js?v=2";
+import { yt, auth, LS, workerUrl, ping, dislikes, ApiError, locale } from "./api.js?v=3";
+import { collectItems, parseNext, parseComments, parseChannel, text, findKey, bestThumb, agoSeconds, fmtDuration, parseDuration, ytThumb } from "./parse.js?v=3";
+import { mountPlayer, getPlayerResponse } from "./player.js?v=3";
+import { downloadOptions, downloadVideo } from "./download.js?v=3";
 
 {
 const $ = (s, el = document) => el.querySelector(s);
@@ -17,6 +18,10 @@ const I = {
   comment: '<svg viewBox="0 0 24 24"><path d="M4.5 5.5h15v10.5H10l-5.5 4z"/></svg>',
   hd: '<svg viewBox="0 0 24 24"><path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9"/><circle cx="15" cy="7.5" r="2"/><circle cx="9" cy="16.5" r="2"/></svg>',
   speed: '<svg viewBox="0 0 24 24"><path d="M4.5 16a7.5 7.5 0 1 1 15 0"/><path d="m12 16 4-5"/></svg>',
+  link: '<svg viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2"/></svg>',
+  more: '<svg viewBox="0 0 24 24"><circle cx="12" cy="5.5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="18.5" r="1.4"/></svg>',
+  hide: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg>',
+  dl: '<svg viewBox="0 0 24 24"><path d="M12 3.5v12M7.5 11 12 15.5 16.5 11M5 19.5h14"/></svg>',
   x: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   yt: '<svg viewBox="0 0 24 24"><path d="M14 4.5h5.5V10M19.5 4.5 11 13M9.5 5.5H6A1.5 1.5 0 0 0 4.5 7v11A1.5 1.5 0 0 0 6 19.5h11a1.5 1.5 0 0 0 1.5-1.5v-3.5"/></svg>',
 };
@@ -28,6 +33,12 @@ const store = {
   add(k, item, max = 500) { const l = this.list(k).filter((x) => x.id !== item.id); l.unshift({ ...item, at: Date.now() }); LS.set(k, l.slice(0, max)); },
   remove(k, id) { LS.set(k, this.list(k).filter((x) => x.id !== id)); },
   toggle(k, item) { if (this.has(k, item.id)) { this.remove(k, item.id); return false; } this.add(k, item); return true; },
+};
+// "Not interested": hidden videos and channels never show up in lists again.
+const hidden = {
+  video(id) { return store.has("hiddenVideos", id); },
+  channel(id) { return !!id && store.has("hiddenChannels", id); },
+  item(v) { return v && v.type !== "channel" && (this.video(v.id) || this.channel(v.channelId)); },
 };
 const settings = () => ({ sponsorblock: true, autoplay: true, ...LS.get("settings", {}) });
 const setSetting = (k, v) => LS.set("settings", { ...LS.get("settings", {}), [k]: v });
@@ -85,6 +96,7 @@ function card(v) {
   if (v.type === "channel") {
     return `<a class="chan-card" href="#/channel/${esc(v.id)}"><img loading="lazy" src="${esc(v.thumb)}" alt="" referrerpolicy="no-referrer"><div><h3>${esc(v.title)}</h3><p>${esc(v.subs || "Channel")}</p></div></a>`;
   }
+  if (hidden.item(v)) return "";
   const pct = progressOf(v.id);
   const sub = [v.channel && `<span data-ch="${esc(v.channelId)}">${esc(v.channel)}</span>`, esc(v.views), esc(v.published)].filter(Boolean).join(" · ");
   return `<a class="card" href="#/watch?v=${esc(v.id)}">
@@ -93,7 +105,8 @@ function card(v) {
       ${pct ? `<span class="progress"><i style="width:${pct.toFixed(1)}%"></i></span>` : ""}
     </div>
     <div class="meta">${v.avatar ? `<img class="av" loading="lazy" src="${esc(v.avatar)}" alt="" referrerpolicy="no-referrer">` : ""}
-      <div><h3>${esc(v.title)}</h3><p>${sub}</p></div></div></a>`;
+      <div class="grow"><h3>${esc(v.title)}</h3><p>${sub}</p></div>
+      <button class="more" type="button" aria-label="More options" data-more="${esc(v.id)}" data-title="${esc(v.title)}" data-chname="${esc(v.channel || "")}" data-chid="${esc(v.channelId || "")}" data-dur="${esc(v.duration || "")}">${I.more}</button></div></a>`;
 }
 
 // A grid that keeps loading as you scroll.
@@ -105,7 +118,7 @@ function feed(container, first, more, { empty, filter } = {}) {
   const sentinel = document.createElement("div");
   sentinel.className = "sentinel";
   const add = (items) => {
-    const fresh = items.filter((i) => !seen.has(i.type + i.id) && (!filter || filter(i)));
+    const fresh = items.filter((i) => !seen.has(i.type + i.id) && !hidden.item(i) && (!filter || filter(i)));
     fresh.forEach((i) => seen.add(i.type + i.id));
     grid.insertAdjacentHTML("beforeend", fresh.map(card).join(""));
     return fresh.length;
@@ -139,12 +152,34 @@ function feed(container, first, more, { empty, filter } = {}) {
 // ---------- Views ----------
 let cleanup = () => {};
 
+// Shelves YouTube adds for everyone (trending, news, gaming…), not picked for you.
+const GENERIC_SHELF = /trending|news|breaking|popular|gaming|sports|movies|explore|fashion|learning|podcasts|new to you|top (songs|videos|hits)|^music$|^live( now)?$|^shorts$/i;
+function shelfTitle(r) {
+  const sr = r.shelfRenderer || r.richShelfRenderer || (r.richSectionRenderer && r.richSectionRenderer.content && r.richSectionRenderer.content.richShelfRenderer);
+  if (!sr) return "";
+  const h = sr.headerRenderer && (sr.headerRenderer.shelfHeaderRenderer || sr.headerRenderer);
+  return text(sr.title) || (h && text(h.title)) || "";
+}
+function pruneGeneric(node, depth = 0) {
+  if (!node || typeof node !== "object" || depth > 40) return node;
+  if (Array.isArray(node)) {
+    for (let i = node.length - 1; i >= 0; i--) {
+      const el = node[i];
+      if (el && typeof el === "object" && GENERIC_SHELF.test(shelfTitle(el))) node.splice(i, 1);
+      else pruneGeneric(el, depth + 1);
+    }
+    return node;
+  }
+  for (const k in node) pruneGeneric(node[k], depth + 1);
+  return node;
+}
+
 async function homeItems() {
   if (auth.signedIn) {
     for (const client of ["tv", "web"]) {
       try {
         const d = await yt("browse", { browseId: "FEwhat_to_watch" }, { client, withAuth: true });
-        const r = collectItems(d);
+        const r = collectItems(pruneGeneric(d));
         if (r.items.filter((i) => i.type === "video").length >= 4) return { ...r, client, withAuth: true };
       } catch (e) { if (e.status === 401) throw e; console.warn("home", client, e); }
     }
@@ -179,7 +214,7 @@ function viewHome() {
   cleanup = feed($("#feed"), async () => { const r = await homeItems(); ctx = r; return r; },
     async (token) => {
       if (ctx.search) return collectItems(await yt("search", { continuation: token }));
-      return collectItems(await yt("browse", { continuation: token }, { client: ctx.client || "web", withAuth: !!ctx.withAuth }));
+      return collectItems(pruneGeneric(await yt("browse", { continuation: token }, { client: ctx.client || "web", withAuth: !!ctx.withAuth })));
     },
     { empty: `<div class="empty"><h2>No recommendations yet</h2><p>Search for something you like and Home fills up from what you watch.</p></div>` });
 }
@@ -205,22 +240,61 @@ const short = (n) => {
 };
 
 function subscribeButton(ch) {
-  const on = store.has("subs", ch.id);
-  return `<button class="btn ${on ? "sub-on" : ""}" data-sub="${esc(ch.id)}">${on ? "Subscribed" : "Subscribe"}</button>`;
+  const on = subCache.has(ch.id) ? subCache.get(ch.id) : store.has("subs", ch.id);
+  return `<button class="btn ${on ? "sub-on" : ""}" data-sub="${esc(ch.id)}" data-on="${on ? "1" : ""}">${on ? "Subscribed" : "Subscribe"}</button>`;
+}
+// Asks your YouTube account whether you're subscribed (once per channel per visit).
+const subCache = new Map();
+function readSubscribed(d) {
+  let found = null;
+  JSON.stringify(d, (k, v) => {
+    if (found === null && v && typeof v === "object" && typeof v.subscribed === "boolean" &&
+        (k === "subscribeButtonRenderer" || k === "subscriptionStateEntity" || k === "subscribeButtonViewModel")) found = v.subscribed;
+    return v;
+  });
+  return found;
+}
+async function checkSubscribed(id) {
+  if (subCache.has(id)) return subCache.get(id);
+  for (const client of ["tv", "web"]) {
+    try {
+      const on = readSubscribed(await yt("browse", { browseId: id }, { client, withAuth: true }));
+      if (on !== null) { subCache.set(id, on); return on; }
+    } catch (e) { console.warn("sub check", client, e); }
+  }
+  return null;
 }
 function bindSubscribe(root, ch) {
   const b = $(`[data-sub]`, root);
   if (!b) return;
+  const show = (on) => { b.textContent = on ? "Subscribed" : "Subscribe"; b.classList.toggle("sub-on", on); b.dataset.on = on ? "1" : ""; };
   b.onclick = async () => {
-    const on = store.toggle("subs", { id: ch.id, title: ch.title, thumb: ch.thumb });
-    b.textContent = on ? "Subscribed" : "Subscribe";
-    b.classList.toggle("sub-on", on);
-    toast(on ? `Subscribed to ${ch.title}` : "Unsubscribed");
+    const on = b.dataset.on !== "1";
+    if (on) store.add("subs", { id: ch.id, title: ch.title, thumb: ch.thumb }); else store.remove("subs", ch.id);
+    subCache.set(ch.id, on);
+    show(on);
+    toast(on ? `Subscribed to ${ch.title || "channel"}` : "Unsubscribed");
     if (auth.signedIn) {
       yt(on ? "subscription/subscribe" : "subscription/unsubscribe", { channelIds: [ch.id] }, { client: "tv", withAuth: true })
         .catch(() => toast("Saved here, but your YouTube account didn't update"));
     }
   };
+  if (auth.signedIn && ch.id) {
+    checkSubscribed(ch.id).then((on) => {
+      if (on === null || !b.isConnected) return;
+      show(on);
+      if (on && !store.has("subs", ch.id)) store.add("subs", { id: ch.id, title: ch.title, thumb: ch.thumb });
+    });
+  }
+}
+
+// Share sheet on phones, copy elsewhere.
+async function shareLink(url, title) {
+  if (navigator.share) {
+    try { await navigator.share({ title: title || "", url }); return; }
+    catch (e) { if (e && e.name === "AbortError") return; }
+  }
+  copy(url, "Link copied");
 }
 
 function viewWatch(id) {
@@ -233,6 +307,7 @@ function viewWatch(id) {
   const playerReady = mountPlayer($("#player"), id, null, {
     onSkip: (cat) => toast(`Skipped ${String(cat).replace("_", " ")}`),
     onMode: (mode, why) => {
+      if (mode === "recovering") toast("Reconnecting…");
       if (mode === "embed") {
         const n = document.createElement("div");
         n.className = "note";
@@ -287,7 +362,9 @@ function viewWatch(id) {
         <button class="pill" id="like">${I.up}<span id="likes">Like</span></button>
         <button class="pill" id="dislike">${I.down}<span id="dislikes"></span></button>
         <button class="pill ${later ? "on" : ""}" id="later">${later ? I.check : I.later}<span>Watch later</span></button>
+        <button class="pill" id="copylink">${I.link}<span>Copy link</span></button>
         <button class="pill" id="share">${I.share}<span>Share</span></button>
+        <button class="pill" id="download">${I.dl}<span>Download</span></button>
         <button class="pill" id="quality">${I.hd}<span>Quality</span></button>
         <button class="pill" id="speed">${I.speed}<span>Speed</span></button>
         ${d.commentsToken ? `<button class="pill" id="comments">${I.comment}<span>Comments</span></button>` : ""}
@@ -308,10 +385,12 @@ function viewWatch(id) {
       e.currentTarget.innerHTML = `${on ? I.check : I.later}<span>Watch later</span>`;
       toast(on ? "Saved to Watch later" : "Removed from Watch later");
     };
-    $("#share").onclick = () => copy(`https://youtu.be/${id}`, "Link copied");
+    $("#copylink").onclick = () => copy(`https://youtu.be/${id}`, "Link copied");
+    $("#share").onclick = () => shareLink(`https://youtu.be/${id}`, title);
     $("#like").onclick = () => rate("like/like", "Liked");
     $("#dislike").onclick = () => rate("like/dislike", "Disliked");
     $("#quality").onclick = qualitySheet;
+    $("#download").onclick = downloadSheet;
     $("#speed").onclick = speedSheet;
     const cb = $("#comments"); if (cb) cb.onclick = () => commentsSheet(d.commentsToken);
     dislikes(id).then((r) => {
@@ -336,6 +415,47 @@ function viewWatch(id) {
       const b = e.target.closest("[data-h]"); if (!b) return;
       ctl.setQuality(b.dataset.h === "auto" ? "auto" : Number(b.dataset.h));
       s.close();
+    });
+  };
+  const downloadSheet = () => {
+    const sd = ctl && ctl.pr && ctl.pr.streamingData;
+    const opts = sd ? downloadOptions(sd) : [];
+    if (!opts.length) { toast(ctl ? "Download isn't available for this video" : "Still loading, try again in a moment"); return; }
+    const mb = (n) => n ? ` · ${Math.max(1, Math.round(n / 1048576))} MB` : "";
+    const s = sheet(`<h2>Download</h2><div id="dlbody">${opts.map((o, i) => `<button class="opt" data-i="${i}">${esc(o.label)}<span class="muted">${mb(o.size)}</span></button>`).join("")}
+      <p class="muted" style="font-size:13px;margin:10px 4px 0">Keep this open until it finishes. Long videos in 1080p take a while and use a lot of memory.</p></div>`, () => ac.abort());
+    const ac = new AbortController();
+    s.el.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-i]"); if (!b) return;
+      const opt = opts[Number(b.dataset.i)];
+      const body = $("#dlbody", s.el);
+      body.innerHTML = `<p style="margin:6px 4px">Downloading ${esc(opt.label)}…</p><div class="dlbar"><i id="dlfill"></i></div><p class="muted" id="dlpct" style="margin:8px 4px">0%</p>`;
+      const title = (nextData && nextData.title) || meta.title || id;
+      const name = title.replace(/[\\/:*?"<>|]+/g, "").slice(0, 80).trim() + ` (${opt.label.split(" ")[0]}).mp4`;
+      try {
+        const blob = await downloadVideo(opt, {
+          durationSec: meta.seconds || Number((ctl.pr.videoDetails || {}).lengthSeconds) || 0,
+          refresh: async () => (await getPlayerResponse(id)).pr.streamingData,
+          signal: ac.signal,
+          onProgress: (f, bytes) => {
+            const fill = $("#dlfill", s.el), pct = $("#dlpct", s.el);
+            if (fill) fill.style.width = (f * 100).toFixed(1) + "%";
+            if (pct) pct.textContent = f ? Math.floor(f * 100) + "%" : Math.round(bytes / 1048576) + " MB";
+          },
+        });
+        const file = new File([blob], name, { type: "video/mp4" });
+        const url = URL.createObjectURL(blob);
+        body.innerHTML = `<p style="margin:6px 4px">Ready: ${esc(name)} (${Math.round(blob.size / 1048576)} MB)</p>
+          <div class="row" style="margin-top:12px;gap:10px;flex-wrap:wrap">
+            ${navigator.canShare && navigator.canShare({ files: [file] }) ? `<button class="btn" id="dlsave">Save video</button>` : ""}
+            <a class="btn ${navigator.canShare ? "ghost" : ""}" href="${url}" download="${esc(name)}" style="display:inline-grid;place-items:center">Save to Files</a>
+          </div><p class="muted" style="font-size:13px;margin:10px 4px 0">"Save video" lets you put it in Photos.</p>`;
+        const sv = $("#dlsave", s.el);
+        if (sv) sv.onclick = async () => { try { await navigator.share({ files: [file], title }); } catch (_) {} };
+      } catch (err) {
+        if (ac.signal.aborted) return;
+        body.innerHTML = `<p style="margin:6px 4px">Couldn't download: ${esc(err.message)}</p>`;
+      }
     });
   };
   const speedSheet = () => {
@@ -427,6 +547,153 @@ function viewChannel(id) {
     const r = collectItems(await yt("browse", { continuation: token }));
     return { items: r.items.map((v) => ({ ...v, channel: v.channel || (ch && ch.title), avatar: "" })), continuation: r.continuation };
   });
+}
+
+// ---------- Shorts (from your own recommendations) ----------
+function collectShorts(data) {
+  const out = [], seen = new Set();
+  const push = (v) => { if (v.id && !seen.has(v.id) && !hidden.video(v.id)) { seen.add(v.id); out.push(v); } };
+  const thumbOf = (t) => bestThumb((t && (t.thumbnails || t.sources)) || []);
+  (function walk(n, d) {
+    if (!n || typeof n !== "object" || d > 90) return;
+    if (Array.isArray(n)) { for (const x of n) walk(x, d + 1); return; }
+    for (const k in n) {
+      const v = n[k];
+      if (k === "reelItemRenderer" && v && v.videoId) {
+        push({ id: v.videoId, title: text(v.headline), views: text(v.viewCountText), thumb: thumbOf(v.thumbnail) });
+        continue;
+      }
+      if (k === "shortsLockupViewModel" && v) {
+        const ep = findKey(v, "reelWatchEndpoint");
+        const om = v.overlayMetadata || {};
+        if (ep && ep.videoId) push({ id: ep.videoId, title: (om.primaryText && om.primaryText.content) || text(v.accessibilityText) || "", views: (om.secondaryText && om.secondaryText.content) || "", thumb: thumbOf(v.thumbnail) });
+        continue;
+      }
+      if ((k === "tileRenderer" || k === "videoRenderer" || k === "gridVideoRenderer" || k === "compactVideoRenderer") && v && JSON.stringify(v).includes("reelWatchEndpoint")) {
+        const ep = findKey(v, "reelWatchEndpoint");
+        const id = (ep && ep.videoId) || v.videoId || v.contentId;
+        const title = text(v.title) || text(v.headline) || text(findKey(v, "title"));
+        if (id) push({ id, title, views: text(v.viewCountText) || "", thumb: thumbOf(v.thumbnail || findKey(v, "thumbnail")) });
+        continue;
+      }
+      walk(v, d + 1);
+    }
+  })(data, 0);
+  return out;
+}
+
+async function shortsBatch(state) {
+  // Pull pages of your signed-in home feed and keep only the Shorts.
+  const found = [];
+  if (!state.sources) {
+    state.sources = auth.signedIn
+      ? [{ client: "web", withAuth: true }, { client: "tv", withAuth: true }]
+      : [{ client: "web", withAuth: false }, { client: "tv", withAuth: false }];
+    state.tokens = {};
+  }
+  for (let round = 0; round < 4 && found.length < 6; round++) {
+    let progressed = false;
+    for (const src of state.sources) {
+      const key = src.client;
+      if (state.tokens[key] === "") continue;
+      try {
+        const d = state.tokens[key]
+          ? await yt("browse", { continuation: state.tokens[key] }, src)
+          : await yt("browse", { browseId: "FEwhat_to_watch" }, src);
+        found.push(...collectShorts(d));
+        const c = collectItems(d).continuation;
+        state.tokens[key] = c && c !== state.tokens[key] ? c : "";
+        progressed = true;
+      } catch (e) { state.tokens[key] = ""; console.warn("shorts", key, e); }
+    }
+    if (!progressed) break;
+  }
+  if (found.length < 3 && !state.searched) {
+    // Not enough Shorts in your feed yet: fill up from Shorts on topics you watch.
+    state.searched = true;
+    const topics = store.list("history").slice(0, 3).map((h) => h.channel).filter(Boolean);
+    for (const q of topics.length ? topics : ["shorts"]) {
+      try { found.push(...collectShorts(await yt("search", { query: q + " #shorts" }))); } catch (_) {}
+    }
+  }
+  return found;
+}
+
+function viewShorts() {
+  view.innerHTML = `<div class="shorts" id="shorts"><div class="short"><div class="spinner"></div></div></div>`;
+  const wrap = $("#shorts");
+  const state = {}, have = new Set();
+  let current = null, currentId = "", loading = false, alive = true, done = false;
+
+  const slide = (v) => `<section class="short" data-id="${esc(v.id)}">
+      <div class="splayer" style="background-image:url('${esc(v.thumb || ytThumb(v.id))}')"></div>
+      <div class="sinfo"><h3>${esc(v.title)}</h3><p>${esc(v.views || "")}</p></div>
+      <div class="sbtns">
+        <button class="sbtn" data-act="copy" aria-label="Copy link">${I.link}</button>
+        <button class="sbtn" data-act="share" aria-label="Share">${I.share}</button>
+        <a class="sbtn" href="#/watch?v=${esc(v.id)}" aria-label="Open as video">${I.yt}</a>
+        <button class="sbtn" data-act="hide" aria-label="Not interested">${I.hide}</button>
+      </div></section>`;
+
+  const more = async () => {
+    if (loading || done) return;
+    loading = true;
+    try {
+      const items = (await shortsBatch(state)).filter((v) => !have.has(v.id));
+      if (!alive) return;
+      if (!items.length && !have.size) {
+        wrap.innerHTML = `<div class="short"><div class="empty" style="color:#fff"><h2>No Shorts yet</h2><p>Your recommendations didn't include any Shorts. Watch a few and check back.</p></div></div>`;
+        done = true;
+      } else if (!items.length) done = true;
+      if (!have.size) wrap.innerHTML = "";
+      items.forEach((v) => have.add(v.id));
+      wrap.insertAdjacentHTML("beforeend", items.map(slide).join(""));
+      wrap.querySelectorAll(".short:not([data-seen])").forEach((el) => { el.dataset.seen = "1"; io.observe(el); });
+    } catch (e) {
+      if (!have.size) wrap.innerHTML = `<div class="short">${errorBox(e, () => { done = false; more(); })}</div>`;
+    }
+    loading = false;
+  };
+
+  const play = async (el) => {
+    const id = el.dataset.id;
+    if (id === currentId) return;
+    if (current) { try { current.destroy(); } catch (_) {} current = null; }
+    wrap.querySelectorAll(".splayer").forEach((p) => { if (p.closest(".short") !== el) p.innerHTML = ""; });
+    currentId = id;
+    const box = $(".splayer", el);
+    box.innerHTML = `<div class="spin"><div class="spinner"></div></div>`;
+    const c = await mountPlayer(box, id, { title: $("h3", el).textContent });
+    if (!alive || currentId !== id) { c.destroy(); return; }
+    current = c;
+    c.video.controls = false;
+    c.video.loop = true;
+    c.video.addEventListener("click", () => { if (c.video.paused) c.video.play().catch(() => {}); else c.video.pause(); });
+    store.add("history", { id, title: $("h3", el).textContent, seconds: Number((c.pr && c.pr.videoDetails || {}).lengthSeconds) || 0 }, 300);
+    // Keep a few ahead loaded
+    const left = [...wrap.children].length - [...wrap.children].indexOf(el);
+    if (left < 4) more();
+  };
+
+  const io = new IntersectionObserver((es) => {
+    for (const e of es) if (e.isIntersecting && e.intersectionRatio > 0.6) play(e.target);
+  }, { root: wrap, threshold: [0.6] });
+
+  wrap.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-act]"); if (!b) return;
+    const el = b.closest(".short"), id = el.dataset.id, url = `https://youtube.com/shorts/${id}`;
+    if (b.dataset.act === "copy") copy(url, "Link copied");
+    if (b.dataset.act === "share") shareLink(url, $("h3", el).textContent);
+    if (b.dataset.act === "hide") {
+      store.add("hiddenVideos", { id }, 2000);
+      const nx = el.nextElementSibling;
+      if (nx) nx.scrollIntoView({ behavior: "smooth" });
+      toast("Got it, you won't see this one again");
+    }
+  });
+
+  more();
+  cleanup = () => { alive = false; io.disconnect(); if (current) current.destroy(); };
 }
 
 function viewSubs() {
@@ -659,7 +926,8 @@ function route() {
   const [path, qs] = h.split("?");
   const q = new URLSearchParams(qs || "");
   const parts = path.split("/").filter(Boolean);
-  const tab = { "": "home", subs: "subs", library: "library", settings: "settings" }[parts[0] || ""] || "";
+  const tab = { "": "home", shorts: "shorts", subs: "subs", library: "library", settings: "settings" }[parts[0] || ""] || "";
+  document.body.classList.toggle("in-shorts", parts[0] === "shorts");
   document.querySelectorAll("#tabbar a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
   document.title = "NewTube Web";
   if (parts[0] !== "search") $("#q").value = "";
@@ -679,6 +947,7 @@ function route() {
   if (parts[0] === "watch" && q.get("v")) return viewWatch(q.get("v"));
   if (parts[0] === "search" && q.get("q")) return viewSearch(q.get("q"));
   if (parts[0] === "channel" && parts[1]) return viewChannel(decodeURIComponent(parts[1]));
+  if (parts[0] === "shorts") return viewShorts();
   if (parts[0] === "subs") return viewSubs();
   if (parts[0] === "library") return viewLibrary(q.get("tab"));
   if (parts[0] === "settings") return viewSettings();
@@ -700,7 +969,36 @@ $("#searchForm").addEventListener("submit", (e) => {
   location.hash = id && /youtu|^[\w-]{11}$/.test(v) ? "#/watch?v=" + id : "#/search?q=" + encodeURIComponent(v);
 });
 
+function cardMenu(b) {
+  const v = { id: b.dataset.more, title: b.dataset.title, channel: b.dataset.chname, channelId: b.dataset.chid, duration: b.dataset.dur };
+  const url = `https://youtu.be/${v.id}`;
+  const later = store.has("later", v.id);
+  const s = sheet(`<h2 style="padding-right:40px">${esc(v.title)}</h2>
+    <button class="opt" data-a="copy">Copy link${I.link}</button>
+    <button class="opt" data-a="share">Share…${I.share}</button>
+    <button class="opt" data-a="later">${later ? "Remove from Watch later" : "Save to Watch later"}${I.later}</button>
+    <button class="opt" data-a="hide">Not interested${I.hide}</button>
+    ${v.channelId ? `<button class="opt" data-a="hidech">Don't recommend ${esc(v.channel || "this channel")}${I.hide}</button>` : ""}`);
+  s.el.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-a]"); if (!a) return;
+    const card = b.closest(".card");
+    const act = a.dataset.a;
+    s.close();
+    if (act === "copy") copy(url, "Link copied");
+    else if (act === "share") shareLink(url, v.title);
+    else if (act === "later") toast(store.toggle("later", v) ? "Saved to Watch later" : "Removed from Watch later");
+    else if (act === "hide") { store.add("hiddenVideos", { id: v.id }, 2000); if (card) card.remove(); toast("Got it, you won't see this video again"); }
+    else if (act === "hidech") {
+      store.add("hiddenChannels", { id: v.channelId, title: v.channel }, 1000);
+      document.querySelectorAll(`[data-chid="${CSS.escape(v.channelId)}"]`).forEach((x) => { const c = x.closest(".card"); if (c) c.remove(); });
+      toast(`You won't see ${v.channel || "this channel"} in your feed`);
+    }
+  });
+}
+
 document.addEventListener("click", (e) => {
+  const more = e.target.closest("[data-more]");
+  if (more) { e.preventDefault(); e.stopPropagation(); cardMenu(more); return; }
   const ch = e.target.closest("[data-ch]");
   if (ch && ch.dataset.ch) { e.preventDefault(); e.stopPropagation(); location.hash = "#/channel/" + ch.dataset.ch; }
 });

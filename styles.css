@@ -273,3 +273,29 @@ pre.diag { background: var(--card); border-radius: 16px; padding: 14px; font-siz
 @keyframes fade { from { opacity: 0; } }
 @keyframes up { from { transform: translateY(40px); opacity: .4; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* ---------- v3: card menu, download, Shorts ---------- */
+.tabbar a { width: min(78px, calc((100vw - 40px) / 5)); }
+.meta .grow { flex: 1; min-width: 0; }
+.meta .more { flex: none; width: 32px; height: 32px; margin: -4px -6px 0 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: var(--sub); cursor: pointer; }
+.meta .more:active { background: var(--lens); }
+.meta .more svg { width: 20px; height: 20px; fill: currentColor; stroke: none; }
+.opt svg { width: 20px; height: 20px; flex: none; }
+.dlbar { height: 8px; margin: 10px 4px 0; border-radius: 99px; background: var(--lens); overflow: hidden; }
+.dlbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: inherit; transition: width .3s; }
+.btn.ghost { background: var(--lens); color: var(--ink); }
+
+body.in-shorts main { padding: 0; max-width: none; }
+.shorts { position: fixed; inset: 0; z-index: 10; background: #000; overflow-y: scroll; scroll-snap-type: y mandatory; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.shorts::-webkit-scrollbar { display: none; }
+.short { position: relative; height: 100dvh; scroll-snap-align: start; scroll-snap-stop: always; display: grid; place-items: center; color: #fff; }
+.short .spinner, .short > .spinner { margin: auto; }
+.splayer { position: relative; height: 100%; width: min(100%, calc(100dvh * 9 / 16)); background: #000 center / cover no-repeat; }
+.splayer video, .splayer iframe { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; border: 0; background: #000; }
+.splayer .spin { position: absolute; inset: 0; display: grid; place-items: center; }
+.sinfo { position: absolute; left: 16px; right: 84px; bottom: calc(96px + env(safe-area-inset-bottom)); text-shadow: 0 1px 6px rgba(0,0,0,.7); pointer-events: none; }
+.sinfo h3 { margin: 0 0 4px; font-size: 16px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.sinfo p { margin: 0; font-size: 13px; opacity: .85; }
+.sbtns { position: absolute; right: 12px; bottom: calc(96px + env(safe-area-inset-bottom)); display: grid; gap: 12px; }
+.sbtn { width: 48px; height: 48px; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(255,255,255,.16); backdrop-filter: blur(14px) saturate(160%); -webkit-backdrop-filter: blur(14px) saturate(160%); color: #fff; cursor: pointer; }
+.sbtn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }

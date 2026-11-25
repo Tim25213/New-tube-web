@@ -1,7 +1,7 @@
 // Ad-free playback: asks YouTube for the raw streams (app clients that need no
 // extra tokens), builds a DASH manifest and plays it with Shaka through your Worker.
 // Falls back to a single 360p file, then to YouTube's embed player.
-import { yt, proxied, sponsorSegments, LS } from "./api.js?v=2";
+import { yt, proxied, sponsorSegments, LS } from "./api.js?v=3";
 
 const xml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -91,6 +91,7 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
     destroy() {
       try { savePos(); } catch (_) {}
       clearInterval(this._iv);
+      clearInterval(this._wd);
       if (this.shaka) this.shaka.destroy();
       video.removeAttribute("src");
       try { video.load(); } catch (_) {}
@@ -108,10 +109,12 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
   ctl._iv = setInterval(savePos, 5000);
   const start = LS.get(posKey, 0) || 0;
 
-  const embed = (why) => {
+  const embed = (why, at = start) => {
     ctl.mode = "embed";
-    if (ctl.shaka) { ctl.shaka.destroy(); ctl.shaka = null; }
-    box.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?autoplay=1&playsinline=1&rel=0&start=${start}" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen title="Video player"></iframe>`;
+    clearInterval(ctl._wd);
+    if (ctl.shaka) { try { ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
+    try { video.pause(); } catch (_) {}
+    box.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?autoplay=1&playsinline=1&rel=0&start=${Math.floor(at || 0)}" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen title="Video player"></iframe>`;
     onMode && onMode("embed", why);
   };
 
@@ -121,42 +124,42 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
     embed(pr && pr.videoDetails && pr.videoDetails.isLive ? "live" : errors.join(" | ") || "no streams");
     return ctl;
   }
-  const sd = pr.streamingData;
   const dur = Number((pr.videoDetails && pr.videoDetails.lengthSeconds) || 0);
 
-  const progressive = () => {
+  const progressive = (sd, at) => {
     const f = (sd.formats || []).filter((f) => f.url).sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-    if (!f) return embed("no progressive stream");
-    if (ctl.shaka) { ctl.shaka.destroy(); ctl.shaka = null; }
+    if (!f) return embed("no progressive stream", at);
+    if (ctl.shaka) { try { ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
     ctl.mode = "progressive";
     video.src = proxied(f.url);
-    if (start) video.currentTime = start;
-    video.onerror = () => embed("progressive stream failed");
+    if (at) video.addEventListener("loadedmetadata", () => { video.currentTime = at; }, { once: true });
+    video.onerror = () => recover("progressive stream failed");
     video.play().catch(() => {});
     onMode && onMode("progressive");
   };
 
-  const mpd = buildMpd(sd, dur);
-  const shaka = window.shaka;
-  if (mpd && shaka && shaka.Player.isBrowserSupported()) {
+  const playDash = async (sd, at) => {
+    const mpd = buildMpd(sd, dur);
+    const shaka = window.shaka;
+    if (!mpd || !shaka || !shaka.Player.isBrowserSupported()) return progressive(sd, at);
     try {
       shaka.polyfill.installAll();
+      if (ctl.shaka) { try { await ctl.shaka.destroy(); } catch (_) {} ctl.shaka = null; }
       const p = new shaka.Player();
       await p.attach(video);
       ctl.shaka = p;
       p.configure({
         preferredVideoCodecs: ["avc1", "vp09", "av01"],
         preferredAudioCodecs: ["mp4a", "opus"],
-        streaming: { bufferingGoal: 40, rebufferingGoal: 1.5, retryParameters: { maxAttempts: 3, timeout: 20000 } },
+        streaming: { bufferingGoal: 30, rebufferingGoal: 1.5, retryParameters: { maxAttempts: 4, baseDelay: 500, timeout: 20000 } },
         abr: { enabled: true, defaultBandwidthEstimate: 2500000 },
       });
-      let fellBack = false;
       p.addEventListener("error", (ev) => {
         console.warn("shaka", ev.detail);
-        if (!fellBack) { fellBack = true; progressive(); }
+        if (p === ctl.shaka && ev.detail && ev.detail.severity === 2) recover("stream error " + ((ev.detail && ev.detail.code) || ""));
       });
       const uri = "data:application/dash+xml;base64," + btoa(unescape(encodeURIComponent(mpd)));
-      await p.load(uri, start || null, "application/dash+xml");
+      await p.load(uri, at || null, "application/dash+xml");
       ctl.mode = "dash";
       const q = LS.get("quality", "auto");
       if (q !== "auto") ctl.setQuality(q);
@@ -164,11 +167,46 @@ export async function mountPlayer(box, id, meta, { onSkip, onMode } = {}) {
       onMode && onMode("dash");
     } catch (e) {
       console.warn("dash failed", e);
-      progressive();
+      progressive(sd, at);
     }
-  } else {
-    progressive();
-  }
+  };
+
+  // If the stream stops (YouTube cuts the connection after a few seconds on some videos),
+  // first get fresh stream addresses and carry on from the same spot; if it stops again,
+  // switch to YouTube's own player at that spot so the video keeps going.
+  let tries = 0, recovering = false;
+  const recover = async (why) => {
+    if (recovering || ctl.mode === "embed") return;
+    recovering = true;
+    const at = video.currentTime > 1 ? video.currentTime : start;
+    tries++;
+    ctl.errors.push(`recover #${tries} at ${Math.floor(at)}s: ${why}`);
+    if (tries <= 1) {
+      onMode && onMode("recovering");
+      try {
+        const fresh = await getPlayerResponse(id);
+        if (fresh.pr && fresh.pr.streamingData) {
+          ctl.pr = fresh.pr;
+          await playDash(fresh.pr.streamingData, at);
+          recovering = false;
+          return;
+        }
+      } catch (_) { /* fall through */ }
+    }
+    embed("stalled: " + why, at);
+    recovering = false;
+  };
+
+  // Watchdog: playing, but the time hasn't moved for 8 seconds = stuck.
+  let lastT = -1, stuck = 0;
+  ctl._wd = setInterval(() => {
+    if (ctl.mode === "embed" || ctl.mode === "loading" || video.paused || video.ended || video.seeking || recovering) { stuck = 0; lastT = video.currentTime; return; }
+    stuck = Math.abs(video.currentTime - lastT) < 0.05 ? stuck + 1 : 0;
+    lastT = video.currentTime;
+    if (stuck >= 8) { stuck = 0; recover("stuck buffering"); }
+  }, 1000);
+
+  await playDash(pr.streamingData, start);
 
   // Lock-screen / headset controls
   if ("mediaSession" in navigator && meta) {

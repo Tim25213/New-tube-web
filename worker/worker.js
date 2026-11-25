@@ -5,13 +5,14 @@
 //   POST /yt/<endpoint>?client=web|tv|vr   -> www.youtube.com/youtubei/v1/<endpoint>
 //   POST /oauth/device, /oauth/token, /oauth/refresh -> Google's TV sign-in (code flow)
 //   GET  /vp?u=<googlevideo url>           -> video bytes (with Range), so playback is ad-free
+//   GET  /hls?u=<googlevideo m3u8 url>      -> HLS playlist with every address pointed back here (iPhone's own player)
 // It keeps nothing: tokens live in your browser and are only passed through.
 //
 // Optional settings (Worker > Settings > Variables):
 //   ALLOWED_ORIGINS  e.g. "https://yourname.github.io" (comma-separated). Strongly recommended.
 //   TV_CLIENT_ID / TV_CLIENT_SECRET  override the YouTube TV sign-in client.
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const YT = "https://www.youtube.com/youtubei/v1/";
 
 const CLIENTS = {
@@ -80,6 +81,7 @@ export default {
     try {
       if (path === "/") return json({ ok: true, name: "newtube-web-backend", version: VERSION }, 200, cors);
       if (path === "/vp") return await proxyVideo(req, url, cors);
+      if (path === "/hls") return await proxyHls(url, cors);
       if (path.startsWith("/yt/") && req.method === "POST") return await innertube(req, url, path.slice(4), cors);
       if (path === "/oauth/device" && req.method === "POST") return await oauthDevice(env, cors);
       if (path === "/oauth/token" && req.method === "POST") return await oauthToken(req, env, cors);
@@ -129,7 +131,7 @@ async function proxyVideo(req, url, cors) {
   if (t.protocol !== "https:" || !t.hostname.endsWith(".googlevideo.com")) {
     return json({ error: "host_not_allowed" }, 400, cors);
   }
-  const headers = { "User-Agent": CLIENTS.vr.ua };
+  const headers = { "User-Agent": /[?&/]c[=/]IOS/.test(target) ? CLIENTS.ios.ua : CLIENTS.vr.ua };
   const range = req.headers.get("Range");
   if (range) headers.Range = range;
   const r = await fetch(t.toString(), { headers, redirect: "follow" });
@@ -140,6 +142,33 @@ async function proxyVideo(req, url, cors) {
   }
   out.set("Cache-Control", "private, max-age=3600");
   return new Response(r.body, { status: r.status, headers: out });
+}
+
+async function proxyHls(url, cors) {
+  const target = url.searchParams.get("u");
+  if (!target) return json({ error: "missing_u" }, 400, cors);
+  const t = new URL(target);
+  if (t.protocol !== "https:" || !(t.hostname.endsWith(".googlevideo.com") || t.hostname.endsWith(".youtube.com"))) {
+    return json({ error: "host_not_allowed" }, 400, cors);
+  }
+  const r = await fetch(t.toString(), { headers: { "User-Agent": CLIENTS.ios.ua } });
+  if (!r.ok) return new Response(await r.text(), { status: r.status, headers: cors });
+  const text = await r.text();
+  const self = url.origin;
+  const wrap = (u) => {
+    const abs = new URL(u, t).toString();
+    const list = /\.m3u8(\?|$)|\/api\/manifest\/hls_(variant|playlist)\//.test(abs);
+    return `${self}/${list ? "hls" : "vp"}?u=${encodeURIComponent(abs)}`;
+  };
+  const out = text.split("\n").map((line) => {
+    const l = line.trim();
+    if (!l) return line;
+    if (l.startsWith("#")) return line.replace(/URI="([^"]+)"/g, (_, u) => `URI="${wrap(u)}"`);
+    return wrap(l);
+  }).join("\n");
+  return new Response(out, {
+    headers: { ...cors, "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "private, max-age=30" },
+  });
 }
 
 async function getTvCreds(env) {
